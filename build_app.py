@@ -13,7 +13,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def build_app(output: Path, python: Path) -> Path:
@@ -33,7 +33,7 @@ def build_app(output: Path, python: Path) -> Path:
     macos = contents / "MacOS"
     resources.mkdir(parents=True)
     macos.mkdir()
-    for name in ("launcher.py", "timezone_probe.py", "README.md", "LICENSE", "config.example.json"):
+    for name in ("launcher.py", "timezone_probe.py", "auto_mode.py", "README.md", "LICENSE", "config.example.json"):
         shutil.copyfile(ROOT / name, resources / name)
     info = {
         "CFBundleName": "Scarf-Codex-Timezone",
@@ -42,7 +42,7 @@ def build_app(output: Path, python: Path) -> Path:
         "CFBundleExecutable": "Scarf-Timezone",
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": VERSION,
-        "CFBundleVersion": "1",
+        "CFBundleVersion": "2",
         "LSUIElement": True,
         "LSMultipleInstancesProhibited": True,
         "NSHighResolutionCapable": True,

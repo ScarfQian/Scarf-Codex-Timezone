@@ -4,15 +4,24 @@
 
 A macOS launcher that starts Codex with the timezone of its verified GPT egress, checks the actual application pages, and restores the normal system timezone on the next launch.
 
-作者：ScarfQian · 首次发布：2026-10-15 · MIT · macOS 实验版 0.1.0
+作者：ScarfQian · 首次发布：2026-10-15 · 更新：2026-10-16 · MIT · macOS 实验版 0.2.0
 
 ## 功能
+
+打开管理工具后，首页提供 **自动模式 / 手动模式 / 更多操作** 三个按钮，并显示当前模式与最近核验状态。
+
+- **自动模式**：保存总开关，安装用户级后台检测，并将原 Codex Dock 入口接入时区启动器。关闭管理窗口不会取消自动，重新登录后继续生效。Codex 未运行时只准备出口目标，不擅自打开软件；从 Dock 时区入口启动时自动设置和核验。
+- **手动模式**：停止并卸载后台检测，恢复本工具替换的原 Dock 入口；不改变正在运行的 Codex 时区。由你决定何时执行下面的操作。
+
+“更多操作”保留原来的功能，并增加“查看自动状态”：
 
 - **按出口启动**：检查 Mihomo 路由，检测 `chatgpt.com` 路径的公网 IP，查询该 IP 的 IANA 时区，使用进程环境变量 `TZ` 启动 Codex。
 - **检查是否成功**：读取实际 Codex 页面，核对时区、当地日期和 UTC 偏移，并重新检查当前出口。报告成功、不一致或无法验证。
 - **恢复本机时区**：完整退出 Codex 后，以不含 `TZ` 的子进程环境重新启动，并核验页面。
 
 不改变 macOS 系统时间或系统时区，不改写 Codex/Clash 的配置，不强制退出应用。Unix 时间戳不变；继承 `TZ` 的子进程如何解释当地时间也可能改变。
+
+**自动模式不等于任意启动方式都能即时改变整个应用。** 在运行中跨时区换出口，或绕过 Dock 时区入口启动原应用时，后台会明确显示“待同步”，提示你保存后完整退出并重开。它不会只改页面来冒充主进程和子进程都已同步，也不会修改已保存的自动化时区。
 
 ## 让自己的 Codex 帮忙配置
 
@@ -51,6 +60,9 @@ python3 -B launcher.py --check-only --json
 python3 -B launcher.py --gui
 python3 -B launcher.py --status --json
 python3 -B launcher.py --restore --json
+python3 -B launcher.py --set-mode auto --json
+python3 -B launcher.py --automation-status --json
+python3 -B launcher.py --set-mode manual --json
 python3 -B launcher.py --config /path/to/config.json --proxy http://127.0.0.1:7890 --codex-group GPT --countries US,CA --check-only --json
 ```
 
@@ -64,13 +76,23 @@ python3 -B build_app.py
 
 生成 `dist/Scarf-Codex-Timezone.app`，可复制到桌面。应用包包含必要脚本，默认读取上述用户目录配置；不复制你的私有配置或系统图标。它依赖构建时选定的 Python 路径，不能把在一台电脑上构建的包当作任意电脑的免依赖安装包。需要时用 `--python /absolute/path/to/python3` 指定本机已有 Python。
 
-双击后选择“按出口启动”“检查是否成功”或“恢复本机时区”，再点击“执行”。点击“取消”不执行操作。
+双击管理工具后可直接选择自动或手动。“更多操作”中的检测、切换和恢复仍需明确选择执行；关闭窗口不改变保存的总开关。
+
+### 自动模式如何持续生效
+
+首次点击自动模式会把必要脚本复制到 `~/Library/Application Support/Scarf-Codex-Timezone/runtime/`，后台不依赖源码目录或外置磁盘。用户级 LaunchAgent 为 `io.github.scarfqian.codex-timezone.auto`，在登录时开始，并约每 15 秒检查一次节点与实例；同节点约每两分钟复查公网 IP。没有系统级服务，也不设置全局 `TZ`。
+
+默认入口安装在 `~/Applications/Scarf-Codex-Timezone-Launch.app`，Dock 名称为“Codex（时区启动）”。重复点击已运行的应用只激活和核验，不关闭进程。原应用更新时不改它的安装包；若更新后由其他入口重开，后台会报告待同步。
+
+切回手动会移除本工具的 LaunchAgent，并恢复它替换的那个 Dock 项，保留你对其他 Dock 项的修改。切回手动不自动恢复当前进程时区；恢复是单独的手动操作。手动时，残留的时区启动入口也按正常环境打开，不再自动检测。
+
+后台只保存一份 `auto-status.json`，显示目标、当前页面核验与检查时间；出口不可确认时不会沿用旧成功结果。正常情况下不反复弹窗，只在进入无法核验或待重启状态时通知一次。
 
 ## 何时恢复
 
 切换和恢复前都要保存工作，并在 **Codex 中按 ⌘Q 完整退出**。工具不替你结束应用。完整退出后从原来的 Codex 图标打开，也会恢复正常启动环境。
 
-只关闭 Codex 窗口、关闭工具菜单或结果提示，均不会恢复仍在运行的进程。运行中换节点不会自动改时区；重新检查发现不一致时，完整退出后再按出口启动。工具本身不常驻。
+只关闭 Codex 窗口、关闭工具菜单或结果提示，均不会恢复仍在运行的进程。自动模式下恢复前先切回手动。运行中换节点不会直接改进程时区；检测不一致时，完整退出后再按出口启动。自动模式的后台检测持续保留，直到切回手动。
 
 ## 成功报告与数据边界
 
@@ -105,7 +127,9 @@ python3 -B timezone_probe.py --codex-group YOUR_GROUP --proxy http://127.0.0.1:Y
 
 `timezone_probe.py` 是独立诊断原型，不读取启动器的 JSON 配置；默认只接受美国出口。其他国家的配置入口在 `launcher.py`。隔离页面测试不使用你的登录目录，也不能替代当前登录实例的验收。
 
-开发者电脑已实测目标时区启动、恢复本机时区，并在实际登录实例确认页面和新消息收到的客户端时区一致；此结果不代表其他电脑已通过验证。
+0.2.0 已在开发者电脑完成 43 项回归检查，以及用户级 LaunchAgent、Dock 接入、自动→手动→自动切换和原 Dock 项恢复的实际验收。桌面菜单关闭后，后台仍定时核验；运行脚本保存在用户目录，不依赖外置磁盘。
+
+独立空白实例通过出口时区启动、持续页面核验、手动正常启动和系统时区恢复。跨时区出口变化使用明确标注的合成情景验证，确认报告待重启并保留运行实例；没有为此切换真实代理节点。实际登录实例的页面与本轮模型收到的客户端时区均为 `America/New_York`，系统仍为 `Asia/Shanghai`。登录时启动已配置，但未执行退出登录或重启电脑实测；其他电脑尚未验收。
 
 ## 许可
 

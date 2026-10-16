@@ -13,6 +13,7 @@ import sys
 import threading
 import tempfile
 import plistlib
+import copy
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
@@ -27,6 +28,7 @@ sys.modules[SPEC.name] = PROTOTYPE
 SPEC.loader.exec_module(PROTOTYPE)
 LAUNCHER_SPEC = importlib.util.spec_from_file_location("timezone_launcher", MODULE_PATH.with_name("launcher.py"))
 LAUNCHER = importlib.util.module_from_spec(LAUNCHER_SPEC)
+sys.modules[LAUNCHER_SPEC.name] = LAUNCHER
 LAUNCHER_SPEC.loader.exec_module(LAUNCHER)
 LAUNCHER.PROTOTYPE = PROTOTYPE
 
@@ -46,7 +48,16 @@ class FragmentedSocket:
         return chunk
 
 
-class PrototypeRegressionTests(unittest.TestCase):
+class IsolatedLauncherTestCase(unittest.TestCase):
+    def setUp(self):
+        self.settings = tempfile.TemporaryDirectory(prefix="scarf-settings-test-")
+        self.addCleanup(self.settings.cleanup)
+        self.settings_patch = patch.object(LAUNCHER, "SETTINGS_DIR", Path(self.settings.name))
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+
+
+class PrototypeRegressionTests(IsolatedLauncherTestCase):
     def test_websocket_split_headers_and_payload(self):
         for size in (2, 126, 65536):
             with self.subTest(payload_size=size):
@@ -222,8 +233,9 @@ class PrototypeRegressionTests(unittest.TestCase):
             self.assertEqual(start.call_args.kwargs["env"]["TZ"], "America/New_York")
 
 
-class LauncherStatusTests(unittest.TestCase):
+class LauncherStatusTests(IsolatedLauncherTestCase):
     def setUp(self):
+        super().setUp()
         self.state = {"pid": 321, "port": 43210, "app_path": PROTOTYPE.DEFAULT_CODEX_APP, "mode": "egress", "timezone_requested": "America/New_York", "system_timezone": "Asia/Shanghai"}
         self.snapshot = {"timestampMs": 1767227400000, "timezone": "America/New_York", "localDate": "2025-12-31", "offsetMinutes": 300}
 
@@ -300,6 +312,14 @@ class LauncherStatusTests(unittest.TestCase):
         self.assertEqual(verify.call_args.args[3], "America/Los_Angeles")
         self.assertEqual(report["status"], "MISMATCH")
 
+    def test_page_success_still_requires_matching_process_start_timezone(self):
+        args = LAUNCHER.parse_args(["--status"])
+        current = PROTOTYPE.EgressInfo("9.9.9.9", "US", "Fixture", "Fixture", "America/Los_Angeles", "fixture")
+        with patch.object(LAUNCHER, "_codex_running", return_value=True), patch.object(LAUNCHER, "_read_state", return_value=self.state), patch.object(LAUNCHER, "_verify_session", return_value={"status": "VERIFIED", "mode": "egress"}), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(current, {})):
+            report = LAUNCHER._status(args)
+        self.assertEqual(report["status"], "MISMATCH")
+        self.assertFalse(report["checks"]["process_start_timezone"])
+
     def test_closed_codex_cannot_reuse_a_previous_success_record(self):
         with patch.object(LAUNCHER, "_codex_running", return_value=False), patch.object(LAUNCHER, "_system_timezone", return_value="Asia/Shanghai"), patch.object(LAUNCHER, "_read_state") as record:
             report = LAUNCHER._status(LAUNCHER.parse_args(["--status"]))
@@ -313,7 +333,7 @@ class LauncherStatusTests(unittest.TestCase):
         network.assert_not_called()
 
 
-class PublicationConfigurationTests(unittest.TestCase):
+class PublicationConfigurationTests(IsolatedLauncherTestCase):
     def test_json_settings_and_cli_override_are_applied(self):
         with tempfile.TemporaryDirectory(prefix="scarf-config-test-") as directory:
             path = Path(directory) / "config.json"
@@ -358,12 +378,145 @@ class PublicationConfigurationTests(unittest.TestCase):
             with (app / "Contents/Info.plist").open("rb") as stream:
                 info = plistlib.load(stream)
             self.assertEqual(info["CFBundleDisplayName"], "Scarf-Codex-Timezone")
-            self.assertEqual({path.name for path in (app / "Contents/Resources").iterdir()}, {"launcher.py", "timezone_probe.py", "README.md", "LICENSE", "config.example.json"})
+            self.assertEqual({path.name for path in (app / "Contents/Resources").iterdir()}, {"launcher.py", "timezone_probe.py", "auto_mode.py", "README.md", "LICENSE", "config.example.json"})
             entry = app / "Contents/MacOS/Scarf-Timezone"
             self.assertTrue(os.access(entry, os.X_OK))
             self.assertIn(str(Path(sys.executable).resolve()), entry.read_text())
             with self.assertRaises(ValueError):
                 build_app.build_app(app, Path(sys.executable))
+
+
+class AutomaticModeTests(IsolatedLauncherTestCase):
+    def setUp(self):
+        super().setUp()
+        self.auto = LAUNCHER.auto_mode
+        self.folder = LAUNCHER.SETTINGS_DIR
+        self.args = LAUNCHER.parse_args(["--state-file", str(self.folder / "session.json")])
+        self.egress = PROTOTYPE.EgressInfo("9.9.9.9", "US", "Fixture", "Fixture", "America/New_York", "fixture")
+        self.route = {"chain": ["GPT", "Example-Node"], "leaf": "Example-Node"}
+
+    def enable_preference(self):
+        LAUNCHER._write_state(self.folder / "preferences.json", {"mode": "auto"})
+
+    def test_mode_persists_and_manual_tick_does_not_probe_or_launch(self):
+        self.assertEqual(self.auto.read_mode(self.folder), "manual")
+        self.enable_preference()
+        self.assertEqual(self.auto.read_mode(self.folder), "auto")
+        LAUNCHER._write_state(self.folder / "preferences.json", {"mode": "manual"})
+        with patch.object(PROTOTYPE, "detect_codex_egress") as detect, patch.object(LAUNCHER, "_launch_codex") as launch:
+            result = self.auto.tick(LAUNCHER, self.args)
+        self.assertEqual(result["status"], "MANUAL")
+        detect.assert_not_called()
+        launch.assert_not_called()
+
+    def run_tick(self, processes, report=None, target_zone=None, state_zone="America/New_York"):
+        self.enable_preference()
+        egress = self.egress if target_zone is None else PROTOTYPE.EgressInfo("9.9.9.9", "US", "Fixture", "Fixture", target_zone, "fixture")
+        state = {"mode": "egress", "timezone_requested": state_zone}
+        with patch.object(PROTOTYPE, "resolve_mihomo_chain", return_value=(self.route["chain"], self.route["leaf"])), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(egress, self.route)), patch.object(PROTOTYPE, "verify_codex_route"), patch.object(LAUNCHER, "_codex_processes", return_value=processes), patch.object(LAUNCHER, "_read_state", return_value=state), patch.object(LAUNCHER, "_verify_session", return_value=report), patch.object(LAUNCHER, "_launch_codex") as launch, patch.object(self.auto, "_notify") as notify:
+            result = self.auto.tick(LAUNCHER, self.args)
+        launch.assert_not_called()
+        return result, notify
+
+    def test_closed_codex_only_prepares_target_and_never_opens_application(self):
+        result, _ = self.run_tick({})
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["target"]["timezone"], "America/New_York")
+
+    def test_page_success_cannot_hide_a_different_process_start_timezone(self):
+        report = {"status": "VERIFIED", "actual_timezones": ["America/Los_Angeles"], "system_timezone_now": "Asia/Shanghai", "checks": {"all_pages": True}}
+        result, notify = self.run_tick({123: "app"}, report, "America/Los_Angeles")
+        self.assertEqual(result["status"], "PENDING_RESTART")
+        notify.assert_called_once()
+        _, repeated_notice = self.run_tick({123: "app"}, report, "America/Los_Angeles")
+        repeated_notice.assert_not_called()
+
+    def test_matching_process_and_pages_are_verified_without_claiming_model_context(self):
+        report = {"status": "VERIFIED", "actual_timezones": ["America/New_York"], "system_timezone_now": "Asia/Shanghai", "checks": {"all_pages": True}}
+        result, _ = self.run_tick({123: "app"}, report)
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertFalse(result["model_context_verified"])
+
+    def test_network_failure_does_not_reuse_old_success(self):
+        self.enable_preference()
+        LAUNCHER._write_state(self.folder / "auto-status.json", {"status": "VERIFIED", "target": {"timezone": "America/New_York"}})
+        with patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto, "_notify"):
+            result = self.auto.tick(LAUNCHER, self.args)
+        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertFalse(result["target_current"])
+
+    def test_switching_manual_during_probe_prevents_status_write_and_notice(self):
+        with patch.object(self.auto, "read_mode", side_effect=["auto", "manual"]), patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto, "_notify") as notify:
+            result = self.auto.tick(LAUNCHER, self.args)
+        self.assertEqual(result["status"], "MANUAL")
+        self.assertFalse((self.folder / "auto-status.json").exists())
+        notify.assert_not_called()
+
+    def test_manual_default_entry_opens_normal_environment_without_network(self):
+        with patch.object(LAUNCHER, "_codex_processes", return_value={}), patch.object(LAUNCHER, "_launch_codex", return_value=123) as launch, patch.object(PROTOTYPE, "detect_codex_egress") as detect:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 0)
+        self.assertIsNone(launch.call_args.args[1])
+        detect.assert_not_called()
+
+    def test_existing_default_entry_does_not_restart_codex(self):
+        self.enable_preference()
+        with patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing") as focus, patch.object(LAUNCHER, "_status", side_effect=PROTOTYPE.PrototypeError("unmanaged")), patch.object(LAUNCHER, "_launch_codex") as launch:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 3)
+        focus.assert_called_once_with(123)
+        launch.assert_not_called()
+
+    def test_restore_requires_manual_mode_first(self):
+        self.enable_preference()
+        with patch.object(LAUNCHER, "_launch_codex") as launch:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--restore", "--json"]), 2)
+        launch.assert_not_called()
+        self.assertEqual(self.auto.read_mode(self.folder), "auto")
+
+    def test_changed_exit_from_default_entry_reports_pending_without_restarting(self):
+        self.enable_preference()
+        with patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing"), patch.object(LAUNCHER, "_status", return_value={"status": "MISMATCH", "message": "mismatch"}), patch.object(LAUNCHER, "_launch_codex") as launch:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 3)
+        self.assertEqual(json.loads(output.getvalue())["status"], "PENDING_RESTART")
+        launch.assert_not_called()
+
+    def test_auto_install_rolls_back_if_service_registration_fails(self):
+        home = self.folder / "fake-home"
+        with patch.object(self.auto.Path, "home", return_value=home), patch.object(self.auto, "_install_runtime", return_value=(self.folder / "runtime", self.folder / "entry.app")), patch.object(self.auto, "dock_enable"), patch.object(self.auto, "dock_restore") as restore, patch.object(self.auto, "service_loaded", return_value=False), patch.object(self.auto, "_service", side_effect=RuntimeError("registration failed")):
+            with self.assertRaises(RuntimeError):
+                self.auto.set_mode(LAUNCHER, self.args, "auto")
+        self.assertEqual(self.auto.read_mode(self.folder), "manual")
+        restore.assert_called_once()
+        self.assertFalse((home / "Library/LaunchAgents" / (self.auto.AGENT_LABEL + ".plist")).exists())
+
+    def test_manual_unloads_only_own_service_and_keeps_codex_running(self):
+        self.enable_preference()
+        with patch.object(self.auto.Path, "home", return_value=self.folder / "fake-home"), patch.object(self.auto, "service_loaded", side_effect=[True, False]), patch.object(self.auto, "_service") as service, patch.object(self.auto, "dock_restore", return_value=True), patch.object(LAUNCHER, "_launch_codex") as launch:
+            result = self.auto.set_mode(LAUNCHER, self.args, "manual")
+        self.assertEqual(result["automation_mode"], "manual")
+        self.assertIn(self.auto.AGENT_LABEL, service.call_args.args[1])
+        self.assertEqual(service.call_args.args[0], "bootout")
+        launch.assert_not_called()
+
+    def test_dock_restore_preserves_user_changes_to_other_entries(self):
+        bundle = self.folder / "Fixture.app"
+        (bundle / "Contents/MacOS").mkdir(parents=True)
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "fixture.codex"}))
+        original = {"tile-data": {"bundle-identifier": "fixture.codex", "file-label": "Fixture"}}
+        other = {"tile-data": {"bundle-identifier": "fixture.other"}}
+        added = {"tile-data": {"bundle-identifier": "fixture.user-added"}}
+        store = {"persistent-apps": [original, other]}
+        def write(tiles):
+            store["persistent-apps"] = copy.deepcopy(tiles)
+        with patch.object(self.auto, "_dock_read", side_effect=lambda: copy.deepcopy(store)), patch.object(self.auto, "_dock_write", side_effect=write):
+            self.auto.dock_enable(self.folder, self.folder / "entry.app", str(bundle / "Contents/MacOS/Fixture"))
+            store["persistent-apps"].insert(0, added)
+            self.auto.dock_restore(self.folder)
+        self.assertEqual(store["persistent-apps"], [added, original, other])
 
 
 if __name__ == "__main__":

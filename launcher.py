@@ -19,7 +19,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from zoneinfo import ZoneInfo
+import auto_mode
 
 
 sys.dont_write_bytecode = True
@@ -73,6 +75,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     action.add_argument("--check-only", action="store_true", help="只检测出口，不启动 Codex")
     action.add_argument("--status", action="store_true", help="只读检查当前实例是否采用目标时区")
     action.add_argument("--restore", action="store_true", help="完整退出 Codex 后，按本机时区重新启动")
+    action.add_argument("--set-mode", choices=("auto", "manual"), help="保存自动或手动模式；自动模式接入 Dock 并安装用户后台服务")
+    action.add_argument("--automation-status", action="store_true", help="查看总开关与后台核验状态")
+    action.add_argument("--default-open", action="store_true", help="默认 Codex 入口：自动模式同步，手动模式正常打开")
+    action.add_argument("--auto-tick", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--gui", action="store_true", help="在 macOS 对话框中显示结果")
     parser.add_argument("--timeout", type=float, default=config.get("timeout", 12.0), help="单项检查超时秒数")
@@ -136,20 +142,33 @@ def _system_timezone() -> str:
 
 
 def _choose_action() -> str | None:
-    script = '''set choice to choose from list {"按出口启动", "检查是否成功", "恢复本机时区"} with title "Scarf-Codex-Timezone" with prompt "切换或恢复前，请先在 Codex 中按 ⌘Q 完整退出。关闭本工具不会恢复仍在运行的 Codex 时区。" default items {"按出口启动"} OK button name "执行" cancel button name "取消"
+    mode = "自动" if auto_mode.read_mode(SETTINGS_DIR) == "auto" else "手动"
+    summary = "由你决定何时检测、切换或恢复。"
+    if mode == "自动":
+        cached = auto_mode._cached(SETTINGS_DIR)
+        summary = cached.get("message", "等待后台首次核验。")
+        if cached and time.time() - cached.get("checked_at", 0) > auto_mode.POLL_SECONDS * 3:
+            summary = "等待新一轮核验，上次记录不代表当前状态。"
+    script = '''on run argv
+set firstChoice to display dialog ("当前模式：" & (item 1 of argv) & return & (item 2 of argv) & return & "自动设置一直保留到选择手动；关闭本工具不会取消自动。") with title "Scarf-Codex-Timezone" buttons {"自动模式", "手动模式", "更多操作"} default button "更多操作"
+set selectedButton to button returned of firstChoice
+if selectedButton is "自动模式" then return "自动模式"
+if selectedButton is "手动模式" then return "手动模式"
+set choice to choose from list {"按出口启动", "检查是否成功", "查看自动状态", "恢复本机时区"} with title "Scarf-Codex-Timezone" with prompt "切换或恢复前请先在 Codex 中按 ⌘Q 完整退出。自动模式下恢复前先切回手动。" default items {"检查是否成功"} OK button name "执行" cancel button name "取消"
 if choice is false then return ""
-return item 1 of choice'''
-    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, check=False)
+return item 1 of choice
+end run'''
+    result = subprocess.run(["/usr/bin/osascript", "-e", script, mode, summary], capture_output=True, text=True, check=False)
     if result.returncode:
         if "-128" in result.stderr:
             return None
         raise PROTOTYPE.PrototypeError("无法显示操作菜单；可以使用 --status 或 --restore 命令入口。")
-    return {"检查是否成功": "status", "恢复本机时区": "restore", "按出口启动": "switch"}.get(result.stdout.strip())
+    return {"自动模式": "auto", "手动模式": "manual", "查看自动状态": "automation_status", "检查是否成功": "status", "恢复本机时区": "restore", "按出口启动": "switch"}.get(result.stdout.strip())
 
 
 def _write_state(path: Path, state: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_suffix(".tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as stream:
             json.dump(state, stream, ensure_ascii=False, indent=2)
@@ -228,6 +247,15 @@ def _emit(value: dict[str, object], as_json: bool, gui: bool = False) -> None:
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return
     lines = [str(value["message"])]
+    if "automation_mode" in value:
+        lines.append("当前模式：" + ("自动（持续生效）" if value["automation_mode"] == "auto" else "手动"))
+    if "auto_status" in value and value["auto_status"]:
+        current = value["auto_status"]
+        target = current.get("target", {}).get("timezone")
+        if target:
+            lines.append(f"最近核验的出口目标：{target}")
+        if current.get("actual_timezones"):
+            lines.append("最近核验的 Codex 时区：" + "、".join(current["actual_timezones"]))
     if "egress" in value:
         egress = value["egress"]
         lines.append(f"出口：{egress['ip']} / {egress['city']} / {egress['timezone']}")
@@ -296,6 +324,12 @@ def _status(args: argparse.Namespace) -> dict[str, object]:
     else:
         expected = _system_timezone()
     report = _verify_session(state, args.codex_app, args.timeout, expected)
+    if state["mode"] == "egress" and expected is not None:
+        # 页面读数一致仍不能替代启动时区；跨时区换节点后必须重新启动整个应用。
+        starts_in_target = state["timezone_requested"] == expected
+        report.setdefault("checks", {})["process_start_timezone"] = starts_in_target
+        if not starts_in_target:
+            report["status"] = "MISMATCH"
     report["message"] = _report_message(report)
     report["guidance"] = SYSTEM_GUIDE if state["mode"] == "system" else RESTORE_GUIDE
     if egress is not None:
@@ -315,17 +349,56 @@ def main(argv: list[str]) -> int:
         _emit({"status": "BLOCKED", "message": str(exc)}, "--json" in argv, "--gui" in argv)
         return 2
     try:
-        if args.gui and not args.json and not (args.check_only or args.status or args.restore):
+        app_module = sys.modules[__name__]
+        explicit = args.check_only or args.status or args.restore or args.set_mode or args.automation_status or args.default_open or args.auto_tick
+        if args.gui and not args.json and not explicit:
             action = _choose_action()
             if action is None:
                 return 0
             args.status = action == "status"
             args.restore = action == "restore"
+            args.set_mode = action if action in ("auto", "manual") else None
+            args.automation_status = action == "automation_status"
+        if args.set_mode:
+            result = auto_mode.set_mode(app_module, args, args.set_mode)
+            _emit(result, args.json, args.gui)
+            return 0
+        if args.automation_status:
+            _emit(auto_mode.details(SETTINGS_DIR), args.json, args.gui)
+            return 0
+        if args.auto_tick:
+            _emit(auto_mode.tick(app_module, args), args.json, False)
+            return 0
+        automation = auto_mode.read_mode(SETTINGS_DIR)
+        if args.restore and automation == "auto":
+            _emit({"status": "BLOCKED", "automation_mode": automation, "message": "自动模式仍在生效。请先点击「手动模式」，再选择恢复本机时区。"}, args.json, args.gui)
+            return 2
+        if args.default_open:
+            processes = _codex_processes(args.codex_app)
+            if processes:
+                auto_mode.focus_existing(next(iter(processes)))
+                if automation == "manual":
+                    _emit({"status": "ALREADY_RUNNING", "automation_mode": automation, "message": "手动模式：已激活现有 Codex，未自动修改时区。"}, args.json, False)
+                    return 0
+                try:
+                    result = _status(args)
+                    if result["status"] == "MISMATCH" or _read_state(args.state_file)["mode"] != "egress":
+                        result.update(status="PENDING_RESTART", message="当前实例尚未与出口完整同步，需保存工作并完整退出，再通过时区入口重开。")
+                except (PROTOTYPE.PrototypeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                    result = {"status": "PENDING_RESTART", "message": f"当前 Codex 尚未同步；请保存后完整退出，再从时区入口打开。{exc}"}
+                result["automation_mode"] = automation
+                _emit(result, args.json, args.gui and result["status"] != "VERIFIED")
+                return 0 if result["status"] == "VERIFIED" else 3
+            if automation == "manual":
+                pid = _launch_codex(args.codex_app, None)
+                _emit({"status": "NORMAL_LAUNCHED", "automation_mode": automation, "pid": pid, "message": "手动模式：已按正常环境打开 Codex，未自动检测或设置时区。"}, args.json, False)
+                return 0
         if args.status:
             try:
                 result = _status(args)
             except (PROTOTYPE.PrototypeError, OSError, subprocess.SubprocessError) as exc:
                 result = {"status": "UNVERIFIED", "message": str(exc), "guidance": RESTORE_GUIDE}
+            result["automation_mode"] = automation
             _emit(result, args.json, args.gui)
             return 0 if result["status"] in ("VERIFIED", "NOT_RUNNING") else 3
         if not args.check_only and _codex_running(args.codex_app):
@@ -358,6 +431,9 @@ def main(argv: list[str]) -> int:
                 raise PROTOTYPE.PrototypeError("检测后 Codex/Magpie 出口发生变化，未启动；请重新点击。")
             PROTOTYPE.verify_codex_route(args.mihomo_socket, args.codex_group, leaf, args.timeout)
         port = PROTOTYPE._find_free_port()
+        if args.default_open and auto_mode.read_mode(SETTINGS_DIR) != "auto":
+            _emit({"status": "CANCELLED", "message": "启动准备期间已切回手动，自动设置已取消。"}, args.json, args.gui)
+            return 2
         pid = _launch_codex(args.codex_app, None if args.restore else target, port)
         state = {"pid": pid, "port": port, "app_path": args.codex_app, "mode": mode, "timezone_requested": target, "system_timezone": system_timezone}
         result.update(pid=pid, timezone_requested=target, guidance=SYSTEM_GUIDE if args.restore else RESTORE_GUIDE)
@@ -367,9 +443,10 @@ def main(argv: list[str]) -> int:
             result["message"] = _report_message(result)
         except (PROTOTYPE.PrototypeError, OSError, subprocess.SubprocessError) as exc:
             result.update(status="UNVERIFIED", message=f"Codex 已启动，但尚未验证时区，不能报告成功：{exc}\n请稍后打开本工具，选择「检查是否成功」。")
-        _emit(result, args.json, args.gui)
+        result["automation_mode"] = automation
+        _emit(result, args.json, args.gui and not (args.default_open and result["status"] == "VERIFIED"))
         return 0 if result["status"] == "VERIFIED" else 3
-    except (PROTOTYPE.PrototypeError, OSError, subprocess.SubprocessError) as exc:
+    except (PROTOTYPE.PrototypeError, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         value = {"status": "BLOCKED", "message": str(exc)}
         _emit(value, args.json, args.gui)
         return 2
