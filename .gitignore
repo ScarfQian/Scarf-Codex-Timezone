@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+config.json
+session.json
+backups/
+dist/
+*.app/
+*.log
