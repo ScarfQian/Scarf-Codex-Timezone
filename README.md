@@ -133,6 +133,22 @@ python3 -B timezone_probe.py --codex-group YOUR_GROUP --proxy http://127.0.0.1:Y
 
 独立空白实例通过出口时区启动、持续页面核验、手动正常启动和系统时区恢复。跨时区出口变化使用明确标注的合成情景验证，确认报告待重启并保留运行实例；没有为此切换真实代理节点。实际登录实例的页面与本轮模型收到的客户端时区均为 `America/New_York`，系统仍为 `Asia/Shanghai`。登录时启动已配置，但未执行退出登录或重启电脑实测；其他电脑尚未验收。
 
+## 版本历史与开发流程
+
+稳定版本由 GitHub 标签固定，可在 [Tags 页面](https://github.com/ScarfQian/Scarf-Codex-Timezone/tags) 查看或下载对应源码包：
+
+| 标签 | 主要功能 | 对应提交 |
+| --- | --- | --- |
+| `v0.1.0` | 手动按出口启动、页面核验与恢复 | [d0e52e6](https://github.com/ScarfQian/Scarf-Codex-Timezone/commit/d0e52e60d274eb7355c7dec3ebfc26ab90a3d96d) |
+| `v0.2.0` | 持久自动／手动模式、后台检测与 Dock 入口 | [1f74b1d](https://github.com/ScarfQian/Scarf-Codex-Timezone/commit/1f74b1d091b17e58ecb5e442670672b6243a6524) |
+| `v0.2.1` | 默认开启、手动关闭记忆与静默运行 | [b098e38](https://github.com/ScarfQian/Scarf-Codex-Timezone/commit/b098e385a95e1d4a371778833c3de4f30ad671a0) |
+
+后续功能、修复和文档修改均从当前 `main` 建立独立远端分支，完成相应验证后创建 PR，审阅后合并到 `main`；发布稳定版本时，再为已验收的提交创建 `vX.Y.Z` 标签。已有版本标签保持原有提交，不移动或覆盖。
+
+查看或使用旧版本可直接定位标签或提交。标签包含公开源码；恢复本机应用时，从对应版本源码重新构建，或使用本机已保留的应用备份。若需撤销 `main` 的某次修改，使用新增撤销提交并通过 PR 合并的方式保留完整历史。
+
+本项目通过 GitHub API 管理远端分支、提交、PR 和标签，本地工作区不初始化 Git 仓库。每次修改先明确发布分支与文件范围，不直接把新修改提交到 `main`。
+
 ## 许可
 
 采用 [MIT License](LICENSE)。项目独立维护，与 OpenAI 或 Clash/Mihomo 无隶属关系。
