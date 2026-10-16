@@ -55,6 +55,8 @@ class IsolatedLauncherTestCase(unittest.TestCase):
         self.settings_patch = patch.object(LAUNCHER, "SETTINGS_DIR", Path(self.settings.name))
         self.settings_patch.start()
         self.addCleanup(self.settings_patch.stop)
+        # 原有用例明确使用关闭设置；首次使用的用例另行移除此记录。
+        LAUNCHER._write_state(Path(self.settings.name) / "preferences.json", {"mode": "manual"})
 
 
 class PrototypeRegressionTests(IsolatedLauncherTestCase):
@@ -398,6 +400,61 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
     def enable_preference(self):
         LAUNCHER._write_state(self.folder / "preferences.json", {"mode": "auto"})
 
+    def test_first_gui_open_enables_auto_before_showing_menu(self):
+        (self.folder / "preferences.json").unlink()
+        self.assertEqual(self.auto.read_mode(self.folder), "auto")
+        def enable(app, args, mode):
+            app._write_state(self.folder / "preferences.json", {"mode": mode})
+        def menu():
+            self.assertEqual(self.auto.read_mode(self.folder), "auto")
+            return None
+        with patch.object(self.auto, "set_mode", side_effect=enable) as install, patch.object(LAUNCHER, "_choose_action", side_effect=menu), patch.object(LAUNCHER, "_launch_codex") as launch:
+            self.assertEqual(LAUNCHER.main(["--gui"]), 0)
+        install.assert_called_once()
+        self.assertEqual(install.call_args.args[2], "auto")
+        launch.assert_not_called()
+        self.assertEqual(self.auto.read_mode(self.folder), "auto")
+
+    def test_saved_off_setting_survives_reopening_gui(self):
+        with patch.object(self.auto, "set_mode") as install, patch.object(LAUNCHER, "_choose_action", return_value=None), patch.object(LAUNCHER, "_launch_codex") as launch:
+            self.assertEqual(LAUNCHER.main(["--gui"]), 0)
+            self.assertEqual(LAUNCHER.main(["--gui"]), 0)
+        install.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(self.auto.read_mode(self.folder), "manual")
+
+    def test_read_only_commands_do_not_install_default_auto(self):
+        (self.folder / "preferences.json").unlink()
+        with patch.object(self.auto, "set_mode") as install, patch.object(self.auto, "details", return_value={"message": "default auto", "automation_mode": "auto"}), patch.object(LAUNCHER, "_status", return_value={"status": "NOT_RUNNING", "message": "closed"}), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(self.egress, self.route)), patch.object(LAUNCHER, "_launch_codex") as launch:
+            for action in ("--status", "--automation-status", "--check-only"):
+                with self.subTest(action=action), redirect_stdout(io.StringIO()):
+                    self.assertEqual(LAUNCHER.main([action, "--json"]), 0)
+        install.assert_not_called()
+        launch.assert_not_called()
+        self.assertFalse((self.folder / "preferences.json").exists())
+
+    def test_first_default_entry_enables_auto_and_preserves_running_codex(self):
+        (self.folder / "preferences.json").unlink()
+        def enable(app, args, mode):
+            app._write_state(self.folder / "preferences.json", {"mode": mode})
+        with patch.object(self.auto, "set_mode", side_effect=enable) as install, patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing"), patch.object(LAUNCHER, "_status", return_value={"status": "VERIFIED", "message": "matched"}), patch.object(LAUNCHER, "_read_state", return_value={"mode": "egress"}), patch.object(LAUNCHER, "_launch_codex") as launch:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 0)
+        install.assert_called_once()
+        launch.assert_not_called()
+        self.assertEqual(self.auto.read_mode(self.folder), "auto")
+
+    def test_closing_auto_from_menu_needs_no_second_dialog(self):
+        self.enable_preference()
+        def change(app, args, mode):
+            app._write_state(self.folder / "preferences.json", {"mode": mode})
+            return {"status": "MODE_CHANGED", "message": "changed"}
+        with patch.object(self.auto, "set_mode", side_effect=change), patch.object(LAUNCHER, "_choose_action", return_value="manual"), patch.object(LAUNCHER, "_emit") as emit, patch.object(LAUNCHER, "_launch_codex") as launch:
+            self.assertEqual(LAUNCHER.main(["--gui"]), 0)
+        self.assertFalse(emit.call_args.args[2])
+        self.assertEqual(self.auto.read_mode(self.folder), "manual")
+        launch.assert_not_called()
+
     def test_mode_persists_and_manual_tick_does_not_probe_or_launch(self):
         self.assertEqual(self.auto.read_mode(self.folder), "manual")
         self.enable_preference()
@@ -413,7 +470,7 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
         self.enable_preference()
         egress = self.egress if target_zone is None else PROTOTYPE.EgressInfo("9.9.9.9", "US", "Fixture", "Fixture", target_zone, "fixture")
         state = {"mode": "egress", "timezone_requested": state_zone}
-        with patch.object(PROTOTYPE, "resolve_mihomo_chain", return_value=(self.route["chain"], self.route["leaf"])), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(egress, self.route)), patch.object(PROTOTYPE, "verify_codex_route"), patch.object(LAUNCHER, "_codex_processes", return_value=processes), patch.object(LAUNCHER, "_read_state", return_value=state), patch.object(LAUNCHER, "_verify_session", return_value=report), patch.object(LAUNCHER, "_launch_codex") as launch, patch.object(self.auto, "_notify") as notify:
+        with patch.object(PROTOTYPE, "resolve_mihomo_chain", return_value=(self.route["chain"], self.route["leaf"])), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(egress, self.route)), patch.object(PROTOTYPE, "verify_codex_route"), patch.object(LAUNCHER, "_codex_processes", return_value=processes), patch.object(LAUNCHER, "_read_state", return_value=state), patch.object(LAUNCHER, "_verify_session", return_value=report), patch.object(LAUNCHER, "_launch_codex") as launch, patch.object(self.auto.subprocess, "run") as notify:
             result = self.auto.tick(LAUNCHER, self.args)
         launch.assert_not_called()
         return result, notify
@@ -427,7 +484,7 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
         report = {"status": "VERIFIED", "actual_timezones": ["America/Los_Angeles"], "system_timezone_now": "Asia/Shanghai", "checks": {"all_pages": True}}
         result, notify = self.run_tick({123: "app"}, report, "America/Los_Angeles")
         self.assertEqual(result["status"], "PENDING_RESTART")
-        notify.assert_called_once()
+        notify.assert_not_called()
         _, repeated_notice = self.run_tick({123: "app"}, report, "America/Los_Angeles")
         repeated_notice.assert_not_called()
 
@@ -440,13 +497,14 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
     def test_network_failure_does_not_reuse_old_success(self):
         self.enable_preference()
         LAUNCHER._write_state(self.folder / "auto-status.json", {"status": "VERIFIED", "target": {"timezone": "America/New_York"}})
-        with patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto, "_notify"):
+        with patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto.subprocess, "run") as dialogs:
             result = self.auto.tick(LAUNCHER, self.args)
         self.assertEqual(result["status"], "UNVERIFIED")
         self.assertFalse(result["target_current"])
+        dialogs.assert_not_called()
 
     def test_switching_manual_during_probe_prevents_status_write_and_notice(self):
-        with patch.object(self.auto, "read_mode", side_effect=["auto", "manual"]), patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto, "_notify") as notify:
+        with patch.object(self.auto, "read_mode", side_effect=["auto", "manual"]), patch.object(PROTOTYPE, "resolve_mihomo_chain", side_effect=PROTOTYPE.PrototypeError("offline")), patch.object(self.auto.subprocess, "run") as notify:
             result = self.auto.tick(LAUNCHER, self.args)
         self.assertEqual(result["status"], "MANUAL")
         self.assertFalse((self.folder / "auto-status.json").exists())
@@ -461,7 +519,7 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
 
     def test_existing_default_entry_does_not_restart_codex(self):
         self.enable_preference()
-        with patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing") as focus, patch.object(LAUNCHER, "_status", side_effect=PROTOTYPE.PrototypeError("unmanaged")), patch.object(LAUNCHER, "_launch_codex") as launch:
+        with patch.object(self.auto, "set_mode"), patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing") as focus, patch.object(LAUNCHER, "_status", side_effect=PROTOTYPE.PrototypeError("unmanaged")), patch.object(LAUNCHER, "_launch_codex") as launch:
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 3)
         focus.assert_called_once_with(123)
@@ -477,12 +535,34 @@ class AutomaticModeTests(IsolatedLauncherTestCase):
 
     def test_changed_exit_from_default_entry_reports_pending_without_restarting(self):
         self.enable_preference()
-        with patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing"), patch.object(LAUNCHER, "_status", return_value={"status": "MISMATCH", "message": "mismatch"}), patch.object(LAUNCHER, "_launch_codex") as launch:
+        with patch.object(self.auto, "set_mode"), patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing"), patch.object(LAUNCHER, "_status", return_value={"status": "MISMATCH", "message": "mismatch"}), patch.object(LAUNCHER, "_launch_codex") as launch:
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(LAUNCHER.main(["--default-open", "--json"]), 3)
         self.assertEqual(json.loads(output.getvalue())["status"], "PENDING_RESTART")
         launch.assert_not_called()
+
+    def test_default_entry_stays_quiet_when_restart_is_needed(self):
+        self.enable_preference()
+        with patch.object(self.auto, "set_mode"), patch.object(LAUNCHER, "_codex_processes", return_value={123: "app"}), patch.object(self.auto, "focus_existing"), patch.object(LAUNCHER, "_status", return_value={"status": "MISMATCH", "message": "pending"}), patch.object(LAUNCHER.subprocess, "run") as dialogs:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--default-open", "--gui"]), 3)
+        dialogs.assert_not_called()
+
+    def test_manual_launch_never_opens_a_timezone_report(self):
+        for status in ("VERIFIED", "UNVERIFIED"):
+            with self.subTest(status=status), patch.object(LAUNCHER, "_choose_action", return_value="switch"), patch.object(LAUNCHER, "_codex_running", return_value=False), patch.object(PROTOTYPE, "detect_codex_egress", return_value=(self.egress, self.route)), patch.object(PROTOTYPE, "resolve_mihomo_chain", return_value=(self.route["chain"], self.route["leaf"])), patch.object(PROTOTYPE, "verify_codex_route"), patch.object(PROTOTYPE, "_find_free_port", return_value=55000), patch.object(LAUNCHER, "_launch_codex", return_value=123), patch.object(LAUNCHER, "_verify_session", return_value={"status": status, "mode": "egress"}), patch.object(LAUNCHER.subprocess, "run") as dialogs:
+                with redirect_stdout(io.StringIO()):
+                    code = LAUNCHER.main(["--gui", "--state-file", str(self.folder / "session.json")])
+                self.assertEqual(code, 0 if status == "VERIFIED" else 3)
+                dialogs.assert_not_called()
+
+    def test_explicit_status_can_still_show_a_report(self):
+        with patch.object(LAUNCHER, "_status", return_value={"status": "VERIFIED", "message": "matched"}), patch.object(LAUNCHER.subprocess, "run") as dialogs:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(LAUNCHER.main(["--status", "--gui"]), 0)
+        dialogs.assert_called_once()
+        self.assertEqual(dialogs.call_args.args[0][0], "/usr/bin/osascript")
 
     def test_auto_install_rolls_back_if_service_registration_fails(self):
         home = self.folder / "fake-home"

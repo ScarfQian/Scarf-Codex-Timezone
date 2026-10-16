@@ -23,7 +23,8 @@ RUNTIME_FILES = ("launcher.py", "timezone_probe.py", "auto_mode.py")
 def read_mode(folder: Path) -> str:
     path = folder / "preferences.json"
     if not path.exists():
-        return "manual"
+        # 首次使用默认开启；显式保存的关闭设置始终优先。
+        return "auto"
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("mode") not in ("auto", "manual"):
         raise ValueError("模式设置无效，请重新选择自动或手动。")
@@ -55,14 +56,14 @@ def details(folder: Path) -> dict:
     cached = _cached(folder)
     if mode == "auto":
         result["auto_status"] = cached
-        result["message"] = "自动模式已启用。" if result["service_loaded"] else "自动模式已保存，但后台服务未运行，需要重新点击自动模式。"
+        result["message"] = "自动跟随已开启。" if result["service_loaded"] else "自动跟随默认开启；请打开本工具完成后台设置。"
         if cached:
             stale = time.time() - cached.get("checked_at", 0) > POLL_SECONDS * 3
             result["status_stale"] = stale
             result["message"] += "\n" + ("等待新一轮核验，上次记录不代表当前状态。" if stale else cached.get("message", ""))
             result["last_checked_at"] = cached.get("checked_at")
     else:
-        result["message"] = "当前为手动模式：由你选择何时检测、切换或恢复。关闭工具不会改变当前 Codex 时区。"
+        result["message"] = "自动跟随已关闭，此设置会保留到你再次点击「开启自动」。当前 Codex 时区保持原样。"
     return result
 
 
@@ -147,10 +148,10 @@ def _install_runtime(app, args) -> tuple[Path, Path]:
             raise ValueError("同名启动入口不属于本工具，未覆盖。")
     macos = contents / "MacOS"
     macos.mkdir(parents=True, exist_ok=True)
-    info = {"CFBundleName": "Codex（时区启动）", "CFBundleDisplayName": "Codex（时区启动）", "CFBundleIdentifier": ENTRY_ID, "CFBundleExecutable": "Scarf-Timezone-Launch", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.2.0", "CFBundleVersion": "2", "LSUIElement": True, "LSMultipleInstancesProhibited": True}
+    info = {"CFBundleName": "Codex（时区启动）", "CFBundleDisplayName": "Codex（时区启动）", "CFBundleIdentifier": ENTRY_ID, "CFBundleExecutable": "Scarf-Timezone-Launch", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.2.1", "CFBundleVersion": "3", "LSUIElement": True, "LSMultipleInstancesProhibited": True}
     existing_info.write_bytes(plistlib.dumps(info))
     script = macos / "Scarf-Timezone-Launch"
-    script.write_text("#!/bin/zsh\nset -euo pipefail\nexec " + shlex.quote(str(Path(sys.executable).resolve())) + " -B " + shlex.quote(str(runtime / "launcher.py")) + ' --default-open --gui "$@"\n', encoding="utf-8")
+    script.write_text("#!/bin/zsh\nset -euo pipefail\nexec " + shlex.quote(str(Path(sys.executable).resolve())) + " -B " + shlex.quote(str(runtime / "launcher.py")) + ' --default-open "$@"\n', encoding="utf-8")
     script.chmod(0o755)
     return runtime, entry
 
@@ -168,7 +169,7 @@ def set_mode(app, args, mode: str) -> dict:
                 raise RuntimeError("已保存手动模式，但后台服务尚未卸载，请再次选择手动；服务不会再执行自动检测。")
         agent_path.unlink(missing_ok=True)
         restored = dock_restore(folder)
-        return {"status": "MODE_CHANGED", "automation_mode": "manual", "service_loaded": False, "dock_restored": restored, "message": "已切换为手动模式，自动监测已停止，原 Dock 入口已恢复。当前 Codex 的时区保持原样；何时切换或恢复由你决定。"}
+        return {"status": "MODE_CHANGED", "automation_mode": "manual", "service_loaded": False, "dock_restored": restored, "message": "自动跟随已关闭，后台检测已停止，原 Dock 入口已恢复。此设置会保留到你再次点击「开启自动」。当前 Codex 的时区保持原样。"}
     if read_mode(folder) == "auto" and service_loaded():
         return details(folder)
     runtime, entry = _install_runtime(app, args)
@@ -187,13 +188,6 @@ def set_mode(app, args, mode: str) -> dict:
         dock_restore(folder)
         raise
     return {"status": "MODE_CHANGED", "automation_mode": "auto", "service_loaded": service_loaded(), "default_entry": str(entry), "message": "自动模式已启用并保存，关闭工具窗口不会取消。后台持续检测出口；日常请使用 Dock 的「Codex（时区启动）」入口。正在运行的 Codex 不会被强制退出；需要重启才能同步时会显示「待同步」。"}
-
-
-def _notify(message: str) -> None:
-    script = '''on run argv
-display notification (item 1 of argv) with title "Codex 自动时区"
-end run'''
-    subprocess.run(["/usr/bin/osascript", "-e", script, message], capture_output=True, check=False, timeout=5)
 
 
 def tick(app, args) -> dict:
@@ -231,14 +225,10 @@ def tick(app, args) -> dict:
                 result.update(status="PENDING_RESTART", message="自动已启用；当前实例无法核验，需要从 Dock 时区入口重新启动后同步。", detail=str(exc))
     except (app.PROTOTYPE.PrototypeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         result.update(status="UNVERIFIED", target=target, target_current=False, message=f"自动已启用，但当前出口暂时无法确认，未修改 Codex：{exc}")
-    # 切回手动时，尚在执行的网络检查不得再覆盖自动状态或通知用户。
+    # 切回手动时，尚在执行的网络检查不得再覆盖自动状态。
     if read_mode(folder) != "auto":
         return {"status": "MANUAL", "automation_mode": "manual", "message": "自动检测已取消。"}
-    notice = [result["status"], result.get("pid"), result.get("timezone_requested")]
     app._write_state(folder / "auto-status.json", result)
-    old_notice = [previous.get("status"), previous.get("pid"), previous.get("timezone_requested")]
-    if notice != old_notice and result["status"] in ("PENDING_RESTART", "UNVERIFIED"):
-        _notify(result["message"])
     return result
 
 

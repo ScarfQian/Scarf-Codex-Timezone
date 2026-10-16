@@ -13,7 +13,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def build_app(output: Path, python: Path) -> Path:
@@ -42,7 +42,7 @@ def build_app(output: Path, python: Path) -> Path:
         "CFBundleExecutable": "Scarf-Timezone",
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": VERSION,
-        "CFBundleVersion": "2",
+        "CFBundleVersion": "3",
         "LSUIElement": True,
         "LSMultipleInstancesProhibited": True,
         "NSHighResolutionCapable": True,
